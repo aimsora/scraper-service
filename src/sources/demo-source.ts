@@ -1,34 +1,42 @@
 import { randomUUID } from "node:crypto";
-import { chromium } from "playwright";
-import type { RawSourceEvent } from "../types";
+import type { SourceAdapter } from "./adapter";
 
-async function detectSourceTitle(url: string): Promise<string> {
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-    return await page.title();
-  } finally {
-    await browser.close();
-  }
-}
-
-export async function collectDemoRaw(usePlaywright: boolean): Promise<RawSourceEvent> {
+export const demoSourceAdapter: SourceAdapter = {
+  code: "demo-source",
+  name: "Demo Source",
+  async collect(context) {
   const sourceUrl = "https://example.org";
-  const pageTitle = usePlaywright ? await detectSourceTitle(sourceUrl) : "Example Domain";
+    const response = await fetch(sourceUrl, {
+      signal: AbortSignal.timeout(context.requestTimeoutMs)
+    });
+    const html = await response.text();
 
-  return {
-    eventId: randomUUID(),
-    source: "demo-source",
-    collectedAt: new Date().toISOString(),
-    url: sourceUrl,
-    payloadVersion: "v1",
-    raw: {
-      title: "Поставка элементов трубопровода",
-      customer: "АО Демонстрационная АЭС",
-      amount: 3200000,
-      currency: "RUB",
-      pageTitle
-    }
-  };
-}
+    return [
+      {
+        url: sourceUrl,
+        raw: {
+          externalId: `demo-${randomUUID()}`,
+          title: "Поставка элементов трубопровода",
+          customer: "АО Демонстрационная АЭС",
+          supplier: "ООО Учебный Поставщик",
+          amount: 3200000,
+          currency: "RUB",
+          publishedAt: context.collectedAt,
+          description: "Демонстрационный источник для локального end-to-end сценария.",
+          pageTitle: html.match(/<title>(.*?)<\/title>/i)?.[1] ?? "Example Domain"
+        },
+        metadata: {
+          adapter: "demo-source"
+        },
+        artifacts: [
+          {
+            kind: "RAW_HTML",
+            fileName: "page.html",
+            contentType: "text/html; charset=utf-8",
+            body: html
+          }
+        ]
+      }
+    ];
+  }
+};
