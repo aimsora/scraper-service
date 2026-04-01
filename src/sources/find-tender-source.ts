@@ -9,6 +9,8 @@ export function createFindTenderAdapter(config: FindTenderConfig): SourceAdapter
     code: "find-tender",
     name: "Find a Tender (UK)",
     async collect(context) {
+      context.logger.info({ apiUrl: config.apiUrl }, "find-tender fetch started");
+
       const response = await fetch(config.apiUrl, {
         signal: AbortSignal.timeout(context.requestTimeoutMs),
         headers: {
@@ -22,11 +24,20 @@ export function createFindTenderAdapter(config: FindTenderConfig): SourceAdapter
 
       const payload = (await response.json()) as Record<string, unknown>;
       const releases = extractReleases(payload).slice(0, 5);
-
-      return releases
+      const normalizedReleases = releases
         .map((release) => normalizeRelease(release))
-        .filter(isNormalizedRelease)
-        .map((release) => ({
+        .filter(isNormalizedRelease);
+
+      if (normalizedReleases.length === 0) {
+        context.logger.warn({ apiUrl: config.apiUrl }, "find-tender returned no usable releases");
+      } else {
+        context.logger.info(
+          { apiUrl: config.apiUrl, itemsCollected: normalizedReleases.length },
+          "find-tender releases collected"
+        );
+      }
+
+      return normalizedReleases.map((release) => ({
           url: release.url,
           raw: release.raw,
           metadata: {
@@ -38,7 +49,7 @@ export function createFindTenderAdapter(config: FindTenderConfig): SourceAdapter
               kind: "RAW_JSON",
               fileName: `${release.externalId}.json`,
               contentType: "application/json",
-              body: JSON.stringify(release.raw, null, 2),
+              body: JSON.stringify(release.sourcePayload, null, 2),
               metadata: {
                 externalId: release.externalId
               }
@@ -102,6 +113,7 @@ function normalizeRelease(release: Record<string, unknown>) {
     url: noticeId
       ? `https://www.find-tender.service.gov.uk/Notice/${encodeURIComponent(noticeId)}`
       : "https://www.find-tender.service.gov.uk",
+    sourcePayload: release,
     raw: {
       ocid,
       noticeId,

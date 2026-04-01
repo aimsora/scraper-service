@@ -10,10 +10,13 @@ export class RawPublisher {
     private readonly queueName: string
   ) {}
 
-  async init(): Promise<void> {
+  async init(additionalQueues: string[] = []): Promise<void> {
     this.connection = await connect(this.rabbitmqUrl);
     this.channel = await this.connection.createChannel();
     await this.channel.assertQueue(this.queueName, { durable: true });
+    await Promise.all(
+      additionalQueues.map((queueName) => this.channel?.assertQueue(queueName, { durable: true }))
+    );
   }
 
   async publish(event: RawSourceEvent): Promise<void> {

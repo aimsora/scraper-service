@@ -1,14 +1,15 @@
+import { setTimeout as delay } from "node:timers/promises";
 import cron from "node-cron";
 import { randomUUID } from "node:crypto";
+import type { Logger } from "pino";
 import { config } from "./config";
 import { logger } from "./logger";
 import { S3ArtifactStore } from "./artifacts/s3-artifact-store";
 import { createRawEventValidator } from "./contracts/raw-event-validator";
 import { RawPublisher } from "./messaging/raw-publisher";
-import { demoSourceAdapter } from "./sources/demo-source";
-import { createFindTenderAdapter } from "./sources/find-tender-source";
 import type { SourceAdapter } from "./sources/adapter";
-import type { RawSourceEvent } from "./types";
+import type { ArtifactDraft, ArtifactRef, RawSourceEvent } from "./types";
+import { resolveEnabledSources } from "./sources";
 import { withRetries } from "./utils/retry";
 
 const publisher = new RawPublisher(config.RABBITMQ_URL, config.QUEUE_RAW_EVENT);
@@ -21,14 +22,8 @@ const artifactStore = new S3ArtifactStore(
   config.S3_SECRET_KEY,
   config.S3_FORCE_PATH_STYLE
 );
-const adapters: SourceAdapter[] = [
-  demoSourceAdapter,
-  createFindTenderAdapter({ apiUrl: config.FIND_TENDER_API_URL })
-].filter((adapter) =>
-  config.ENABLED_SOURCES.split(",")
-    .map((item) => item.trim())
-    .includes(adapter.code)
-);
+const resolvedSources = resolveEnabledSources(config);
+const adapters: SourceAdapter[] = resolvedSources.adapters;
 
 const circuitState = new Map<string, { failures: number; openUntil?: number }>();
 let running = false;
@@ -36,7 +31,10 @@ let running = false;
 async function runAdapter(adapter: SourceAdapter): Promise<void> {
   const state = circuitState.get(adapter.code);
   if (state?.openUntil && state.openUntil > Date.now()) {
-    logger.warn({ source: adapter.code, openUntil: state.openUntil }, "circuit breaker is open");
+    logger.warn(
+      { source: adapter.code, failures: state.failures, openUntil: state.openUntil },
+      "circuit breaker is open"
+    );
     return;
   }
 
@@ -45,6 +43,8 @@ async function runAdapter(adapter: SourceAdapter): Promise<void> {
   const childLogger = logger.child({ source: adapter.code, runKey });
 
   try {
+    childLogger.info({ sourceName: adapter.name }, "source run started");
+
     const records = await withRetries(
       () =>
         adapter.collect({
@@ -54,60 +54,104 @@ async function runAdapter(adapter: SourceAdapter): Promise<void> {
           logger: childLogger
         }),
       config.RETRY_ATTEMPTS,
-      config.RETRY_BASE_DELAY_MS
+      config.RETRY_BASE_DELAY_MS,
+      {
+        onRetry: async ({ attempt, maxAttempts, delayMs, error }) => {
+          childLogger.warn(
+            {
+              attempt,
+              maxAttempts,
+              delayMs,
+              err: error
+            },
+            "source collect attempt failed; retry scheduled"
+          );
+        }
+      }
     );
 
-    for (const record of records) {
-      const eventId = randomUUID();
-      const artifacts = [];
-      for (const artifact of record.artifacts ?? []) {
-        artifacts.push(await artifactStore.upload(adapter.code, runKey, eventId, artifact));
-      }
+    childLogger.info({ itemsCollected: records.length }, "items collected");
 
-      const event: RawSourceEvent = {
-        eventId,
+    for (const [itemIndex, record] of records.entries()) {
+      await processCollectedRecord({
+        adapter,
         runKey,
-        source: adapter.code,
         collectedAt,
-        url: record.url,
-        payloadVersion: "v1",
-        artifacts,
-        metadata: record.metadata,
-        raw: record.raw
-      };
+        record,
+        itemIndex: itemIndex + 1,
+        logger: childLogger
+      });
+    }
 
-      try {
-        validateRaw(event);
-        await publisher.publish(event);
-        childLogger.info({ eventId }, "raw event published");
-      } catch (error) {
-        await publisher.publishTo(config.QUEUE_QUARANTINE_EVENT, {
-          reason: error instanceof Error ? error.message : "Unknown validation error",
-          event
-        });
-        childLogger.error({ err: error, eventId }, "raw event moved to quarantine");
-      }
+    if ((state?.failures ?? 0) > 0) {
+      childLogger.info({ previousFailures: state?.failures ?? 0 }, "circuit breaker state reset");
     }
 
     circuitState.set(adapter.code, { failures: 0 });
   } catch (error) {
     const failures = (circuitState.get(adapter.code)?.failures ?? 0) + 1;
+    const openUntil =
+      failures >= config.CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        ? Date.now() + config.CIRCUIT_BREAKER_OPEN_MS
+        : undefined;
+
     circuitState.set(adapter.code, {
       failures,
-      openUntil: failures >= 3 ? Date.now() + 10 * 60 * 1000 : undefined
+      openUntil
     });
-    childLogger.error({ err: error, failures }, "source run failed");
+    childLogger.error(
+      {
+        err: error,
+        failures,
+        openUntil,
+        circuitBreakerThreshold: config.CIRCUIT_BREAKER_FAILURE_THRESHOLD
+      },
+      "source run failed"
+    );
   }
 }
 
 async function bootstrap(): Promise<void> {
-  await publisher.init();
+  await connectPublisher();
+
+  if (resolvedSources.unknownCodes.length > 0) {
+    logger.warn(
+      {
+        unknownSources: resolvedSources.unknownCodes,
+        availableSources: ["demo-source", "find-tender"]
+      },
+      "unknown sources requested via ENABLED_SOURCES"
+    );
+  }
+
+  if (resolvedSources.fallbackApplied) {
+    logger.warn(
+      {
+        requestedSources: resolvedSources.requestedCodes,
+        fallbackSource: "demo-source"
+      },
+      "no known sources resolved; demo-source fallback enabled"
+    );
+  }
+
+  logger.info(
+    {
+      requestedSources: resolvedSources.requestedCodes,
+      loadedSources: resolvedSources.loadedCodes,
+      proxyConfigured: Boolean(config.HTTP_PROXY || config.HTTPS_PROXY),
+      proxyNoProxyConfigured: Boolean(config.NO_PROXY)
+    },
+    "loaded enabled sources"
+  );
 
   logger.info({
     queueRaw: config.QUEUE_RAW_EVENT,
     queueQuarantine: config.QUEUE_QUARANTINE_EVENT,
     schedule: config.SCRAPE_SCHEDULE,
-    enabledSources: adapters.map((adapter) => adapter.code)
+    enabledSources: adapters.map((adapter) => adapter.code),
+    s3Endpoint: config.S3_ENDPOINT,
+    s3Bucket: config.S3_BUCKET,
+    sharedContractsDir: config.SHARED_CONTRACTS_DIR
   }, "scraper-service starting");
 
   const runAll = async (): Promise<void> => {
@@ -117,6 +161,10 @@ async function bootstrap(): Promise<void> {
     }
     running = true;
     try {
+      logger.info(
+        { enabledSources: adapters.map((adapter) => adapter.code), schedule: config.SCRAPE_SCHEDULE },
+        "scheduled run started"
+      );
       await Promise.allSettled(adapters.map((adapter) => runAdapter(adapter)));
     } finally {
       running = false;
@@ -130,7 +178,142 @@ async function bootstrap(): Promise<void> {
   });
 }
 
+async function connectPublisher(): Promise<void> {
+  let attempt = 0;
+
+  while (true) {
+    attempt += 1;
+
+    try {
+      await publisher.init([config.QUEUE_QUARANTINE_EVENT]);
+      logger.info(
+        {
+          rabbitmqUrl: config.RABBITMQ_URL,
+          queueRaw: config.QUEUE_RAW_EVENT,
+          queueQuarantine: config.QUEUE_QUARANTINE_EVENT
+        },
+        "connected to rabbitmq"
+      );
+      return;
+    } catch (error) {
+      const delayMs = Math.min(config.RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), 30000);
+      logger.warn(
+        { err: error, rabbitmqUrl: config.RABBITMQ_URL, attempt, delayMs },
+        "failed to connect to rabbitmq, retrying"
+      );
+      await delay(delayMs);
+    }
+  }
+}
+
 void bootstrap().catch((error) => {
   logger.error({ err: error }, "scraper-service crashed");
   process.exit(1);
 });
+
+async function processCollectedRecord(input: {
+  adapter: SourceAdapter;
+  runKey: string;
+  collectedAt: string;
+  record: {
+    url: string;
+    raw: Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+    artifacts?: ArtifactDraft[];
+  };
+  itemIndex: number;
+  logger: Logger;
+}): Promise<void> {
+  const eventId = randomUUID();
+  const itemLogger = input.logger.child({
+    eventId,
+    itemIndex: input.itemIndex,
+    sourceUrl: input.record.url
+  });
+
+  try {
+    const artifacts = await uploadArtifactsSafely(
+      input.adapter.code,
+      input.runKey,
+      eventId,
+      input.record.artifacts ?? [],
+      itemLogger
+    );
+
+    const event: RawSourceEvent = {
+      eventId,
+      runKey: input.runKey,
+      source: input.adapter.code,
+      collectedAt: input.collectedAt,
+      url: input.record.url,
+      payloadVersion: "v1",
+      artifacts,
+      metadata: input.record.metadata,
+      raw: input.record.raw
+    };
+
+    validateRaw(event);
+    await publisher.publish(event);
+    itemLogger.info({ artifactCount: artifacts.length }, "raw event published");
+  } catch (error) {
+    const quarantinePayload = {
+      reason: error instanceof Error ? error.message : "Unknown item processing error",
+      source: input.adapter.code,
+      runKey: input.runKey,
+      collectedAt: input.collectedAt,
+      itemIndex: input.itemIndex,
+      item: {
+        url: input.record.url,
+        metadata: input.record.metadata,
+        raw: input.record.raw
+      }
+    };
+
+    try {
+      await publisher.publishTo(config.QUEUE_QUARANTINE_EVENT, quarantinePayload);
+      itemLogger.error({ err: error }, "item moved to quarantine");
+    } catch (quarantineError) {
+      itemLogger.error(
+        { err: quarantineError, originalErr: error },
+        "item processing failed and quarantine publish also failed"
+      );
+    }
+  }
+}
+
+async function uploadArtifactsSafely(
+  source: string,
+  runKey: string,
+  eventId: string,
+  artifacts: ArtifactDraft[],
+  log: Logger
+): Promise<ArtifactRef[]> {
+  const uploadedArtifacts: ArtifactRef[] = [];
+
+  for (const artifact of artifacts) {
+    try {
+      uploadedArtifacts.push(await artifactStore.upload(source, runKey, eventId, artifact));
+    } catch (error) {
+      log.error(
+        {
+          err: error,
+          artifactFileName: artifact.fileName,
+          artifactKind: artifact.kind,
+          s3Endpoint: config.S3_ENDPOINT,
+          s3Bucket: config.S3_BUCKET
+        },
+        "artifact upload failed; continuing without this artifact"
+      );
+    }
+  }
+
+  log.info(
+    {
+      requestedArtifacts: artifacts.length,
+      uploadedArtifacts: uploadedArtifacts.length
+    },
+    "artifacts uploaded"
+  );
+
+  return uploadedArtifacts;
+}
