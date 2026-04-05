@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import type { Logger } from "pino";
 import { config } from "./config";
+import { configureHttpTransport, fetch } from "./http-client";
 import { logger } from "./logger";
 import { S3ArtifactStore } from "./artifacts/s3-artifact-store";
 import { createRawEventValidator } from "./contracts/raw-event-validator";
@@ -69,6 +70,13 @@ async function runAdapter(
   runningSources.add(adapter.code);
 
   try {
+    await reportSourceRunState({
+      sourceCode: adapter.code,
+      runKey,
+      status: "RUNNING",
+      startedAt: collectedAt
+    }, childLogger);
+
     childLogger.info({ sourceName: adapter.name }, "source run started");
 
     const records = await withRetries(
@@ -114,6 +122,14 @@ async function runAdapter(
     }
 
     circuitState.set(adapter.code, { failures: 0 });
+    await reportSourceRunState({
+      sourceCode: adapter.code,
+      runKey,
+      status: "SUCCESS",
+      startedAt: collectedAt,
+      finishedAt: new Date().toISOString(),
+      itemsDiscovered: records.length
+    }, childLogger);
   } catch (error) {
     const failures = (circuitState.get(adapter.code)?.failures ?? 0) + 1;
     const openUntil =
@@ -134,12 +150,21 @@ async function runAdapter(
       },
       "source run failed"
     );
+    await reportSourceRunState({
+      sourceCode: adapter.code,
+      runKey,
+      status: "FAILED",
+      startedAt: collectedAt,
+      finishedAt: new Date().toISOString(),
+      errorMessage: error instanceof Error ? error.message : "Source run failed"
+    }, childLogger);
   } finally {
     runningSources.delete(adapter.code);
   }
 }
 
 async function bootstrap(): Promise<void> {
+  configureHttpTransport(logger);
   await connectPublisher();
   startControlServer();
   await hydrateRuntimeConfig();
@@ -323,6 +348,47 @@ async function hydrateRuntimeConfig() {
     logger.warn(
       { err: error, backendInternalUrl: config.BACKEND_INTERNAL_URL },
       "failed to load runtime settings from backend; local defaults will be used"
+    );
+  }
+}
+
+async function reportSourceRunState(
+  payload: {
+    sourceCode: string;
+    runKey: string;
+    status: "RUNNING" | "SUCCESS" | "FAILED";
+    startedAt: string;
+    finishedAt?: string;
+    errorMessage?: string;
+    itemsDiscovered?: number;
+  },
+  childLogger: Logger
+) {
+  if (!config.API_INGEST_TOKEN) {
+    return;
+  }
+
+  try {
+    const response = await fetch(config.BACKEND_SOURCE_RUNS_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-ingest-token": config.API_INGEST_TOKEN
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      throw new Error(`backend returned ${response.status}`);
+    }
+  } catch (error) {
+    childLogger.warn(
+      {
+        err: error,
+        backendSourceRunsUrl: config.BACKEND_SOURCE_RUNS_URL,
+        reportStatus: payload.status
+      },
+      "failed to report source run state to backend"
     );
   }
 }

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Logger } from "pino";
+import { describeOutboundHttpError, fetch } from "../../http-client";
 import { withRetries } from "../../utils/retry";
 import { parseEisNoticePage, parseEisSearchResults } from "./eis-parser";
 import type { EisClientConfig, EisParsedNotice, EisSearchResultLink } from "./types";
@@ -35,13 +36,18 @@ export class EisClient {
   ): Promise<string> {
     return withRetries(
       async () => {
-        const response = await fetch(url, {
-          signal: AbortSignal.timeout(requestTimeoutMs),
-          headers: {
-            accept: "text/html,application/xhtml+xml",
-            "user-agent": this.config.userAgent
-          }
-        });
+        let response;
+        try {
+          response = await fetch(url, {
+            signal: AbortSignal.timeout(requestTimeoutMs),
+            headers: {
+              accept: "text/html,application/xhtml+xml",
+              "user-agent": this.config.userAgent
+            }
+          });
+        } catch (error) {
+          throw describeOutboundHttpError(error, url);
+        }
 
         if (!response.ok) {
           throw new Error(`EIS ${resourceName} returned HTTP ${response.status}`);

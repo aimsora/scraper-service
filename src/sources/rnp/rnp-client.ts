@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { describeOutboundHttpError, fetch } from "../../http-client";
 import { withRetries } from "../../utils/retry";
 import { parseRnpDetailPage, parseRnpSearchResults } from "./rnp-parser";
 import type { RnpClientConfig, RnpParsedEntry, RnpSearchResultLink } from "./types";
@@ -34,13 +35,18 @@ export class RnpClient {
   ): Promise<string> {
     return withRetries(
       async () => {
-        const response = await fetch(url, {
-          signal: AbortSignal.timeout(requestTimeoutMs),
-          headers: {
-            accept: "text/html,application/xhtml+xml",
-            "user-agent": this.config.userAgent
-          }
-        });
+        let response;
+        try {
+          response = await fetch(url, {
+            signal: AbortSignal.timeout(requestTimeoutMs),
+            headers: {
+              accept: "text/html,application/xhtml+xml",
+              "user-agent": this.config.userAgent
+            }
+          });
+        } catch (error) {
+          throw describeOutboundHttpError(error, url);
+        }
 
         if (!response.ok) {
           throw new Error(`RNP ${resourceName} returned HTTP ${response.status}`);

@@ -58,6 +58,11 @@ ENABLED_SOURCES=easuz,eis,rnp,fedresurs,fns,gistorgi
 - `QUEUE_RAW_EVENT`
 - `QUEUE_QUARANTINE_EVENT`
 - `SCRAPE_SCHEDULE`
+- `REQUEST_TIMEOUT_MS`
+- `RETRY_ATTEMPTS`
+- `RETRY_BASE_DELAY_MS`
+- `CIRCUIT_BREAKER_FAILURE_THRESHOLD`
+- `CIRCUIT_BREAKER_OPEN_MS`
 - `SHARED_CONTRACTS_DIR`
 - `ENABLED_SOURCES`
 - `S3_ENDPOINT`
@@ -69,6 +74,13 @@ ENABLED_SOURCES=easuz,eis,rnp,fedresurs,fns,gistorgi
 - `HTTP_PROXY`
 - `HTTPS_PROXY`
 - `NO_PROXY`
+
+Если часть государственных площадок недоступна из текущего контура, настрой `HTTPS_PROXY`/`HTTP_PROXY`. Для внутренних сервисов оставляй `NO_PROXY`, например:
+
+```env
+HTTPS_PROXY=http://proxy.internal:3128
+NO_PROXY=localhost,127.0.0.1,backend-api,postgres,redis,rabbitmq,minio
+```
 
 ## Локальная проверка
 

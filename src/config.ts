@@ -25,6 +25,10 @@ const envSchema = z.object({
     .string()
     .url()
     .default("http://backend-api:3000/api/internal/scraper/config"),
+  BACKEND_SOURCE_RUNS_URL: z
+    .string()
+    .url()
+    .default("http://backend-api:3000/api/internal/scraper/source-runs"),
   API_INGEST_TOKEN: z.string().optional(),
   RABBITMQ_URL: z.string().default("amqp://app:app@localhost:5672"),
   QUEUE_RAW_EVENT: z.string().default("source.raw.v1"),

@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { describeOutboundHttpError, fetch } from "../../http-client";
 import { withRetries } from "../../utils/retry";
 import { parseFnsSearchRows } from "./fns-parser";
 import type {
@@ -60,16 +61,21 @@ export class FnsClient {
   ): Promise<FnsSearchInitResponse> {
     return withRetries(
       async () => {
-        const response = await fetch(this.config.baseUrl, {
-          method: "POST",
-          signal: AbortSignal.timeout(requestTimeoutMs),
-          headers: {
-            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-            accept: "application/json",
-            "user-agent": this.config.userAgent
-          },
-          body: new URLSearchParams({ query }).toString()
-        });
+        let response;
+        try {
+          response = await fetch(this.config.baseUrl, {
+            method: "POST",
+            signal: AbortSignal.timeout(requestTimeoutMs),
+            headers: {
+              "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+              accept: "application/json",
+              "user-agent": this.config.userAgent
+            },
+            body: new URLSearchParams({ query }).toString()
+          });
+        } catch (error) {
+          throw describeOutboundHttpError(error, this.config.baseUrl);
+        }
 
         if (!response.ok) {
           throw new Error(`FNS search init returned HTTP ${response.status}`);
@@ -95,13 +101,18 @@ export class FnsClient {
     const searchUrl = `${trimTrailingSlash(this.config.baseUrl)}/search-result/${token}`;
 
     for (let attempt = 1; attempt <= 10; attempt += 1) {
-      const response = await fetch(`${searchUrl}?r=${Date.now()}`, {
-        signal: AbortSignal.timeout(requestTimeoutMs),
-        headers: {
-          accept: "application/json",
-          "user-agent": this.config.userAgent
-        }
-      });
+      let response;
+      try {
+        response = await fetch(`${searchUrl}?r=${Date.now()}`, {
+          signal: AbortSignal.timeout(requestTimeoutMs),
+          headers: {
+            accept: "application/json",
+            "user-agent": this.config.userAgent
+          }
+        });
+      } catch (error) {
+        throw describeOutboundHttpError(error, searchUrl);
+      }
 
       if (!response.ok) {
         throw new Error(`FNS search result returned HTTP ${response.status}`);
@@ -126,13 +137,18 @@ export class FnsClient {
   ): Promise<Buffer> {
     const baseUrl = trimTrailingSlash(this.config.baseUrl);
     const requestUrl = `${baseUrl}/vyp-request/${extractToken}?r=${Date.now()}`;
-    const requestResponse = await fetch(requestUrl, {
-      signal: AbortSignal.timeout(requestTimeoutMs),
-      headers: {
-        accept: "application/json",
-        "user-agent": this.config.userAgent
-      }
-    });
+    let requestResponse;
+    try {
+      requestResponse = await fetch(requestUrl, {
+        signal: AbortSignal.timeout(requestTimeoutMs),
+        headers: {
+          accept: "application/json",
+          "user-agent": this.config.userAgent
+        }
+      });
+    } catch (error) {
+      throw describeOutboundHttpError(error, requestUrl);
+    }
 
     if (!requestResponse.ok) {
       throw new Error(`FNS extract request returned HTTP ${requestResponse.status}`);
@@ -144,13 +160,19 @@ export class FnsClient {
     }
 
     for (let attempt = 1; attempt <= 10; attempt += 1) {
-      const statusResponse = await fetch(`${baseUrl}/vyp-status/${extractToken}?r=${Date.now()}`, {
-        signal: AbortSignal.timeout(requestTimeoutMs),
-        headers: {
-          accept: "application/json",
-          "user-agent": this.config.userAgent
-        }
-      });
+      let statusResponse;
+      const statusUrl = `${baseUrl}/vyp-status/${extractToken}?r=${Date.now()}`;
+      try {
+        statusResponse = await fetch(statusUrl, {
+          signal: AbortSignal.timeout(requestTimeoutMs),
+          headers: {
+            accept: "application/json",
+            "user-agent": this.config.userAgent
+          }
+        });
+      } catch (error) {
+        throw describeOutboundHttpError(error, statusUrl);
+      }
 
       if (!statusResponse.ok) {
         throw new Error(`FNS extract status returned HTTP ${statusResponse.status}`);
@@ -158,13 +180,19 @@ export class FnsClient {
 
       const statusPayload = (await statusResponse.json()) as { status?: string };
       if (statusPayload.status === "ready") {
-        const fileResponse = await fetch(`${baseUrl}/vyp-download/${extractToken}`, {
-          signal: AbortSignal.timeout(requestTimeoutMs),
-          headers: {
-            accept: "application/pdf",
-            "user-agent": this.config.userAgent
-          }
-        });
+        const fileUrl = `${baseUrl}/vyp-download/${extractToken}`;
+        let fileResponse;
+        try {
+          fileResponse = await fetch(fileUrl, {
+            signal: AbortSignal.timeout(requestTimeoutMs),
+            headers: {
+              accept: "application/pdf",
+              "user-agent": this.config.userAgent
+            }
+          });
+        } catch (error) {
+          throw describeOutboundHttpError(error, fileUrl);
+        }
 
         if (!fileResponse.ok) {
           throw new Error(`FNS extract download returned HTTP ${fileResponse.status}`);

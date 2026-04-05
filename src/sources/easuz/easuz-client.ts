@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Logger } from "pino";
+import { describeOutboundHttpError, fetch } from "../../http-client";
 import { withRetries } from "../../utils/retry";
 import { parseEasuzNoticePage, parseEasuzSearchResults } from "./easuz-parser";
 import type { EasuzClientConfig, EasuzParsedNotice, EasuzSearchResultLink } from "./types";
@@ -36,14 +37,19 @@ export class EasuzClient {
   ): Promise<string> {
     return withRetries(
       async () => {
-        const response = await fetch(url, {
-          signal: AbortSignal.timeout(requestTimeoutMs),
-          headers: {
-            accept: "text/html,application/xhtml+xml",
-            "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
-            "user-agent": this.config.userAgent
-          }
-        });
+        let response;
+        try {
+          response = await fetch(url, {
+            signal: AbortSignal.timeout(requestTimeoutMs),
+            headers: {
+              accept: "text/html,application/xhtml+xml",
+              "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
+              "user-agent": this.config.userAgent
+            }
+          });
+        } catch (error) {
+          throw describeOutboundHttpError(error, url);
+        }
 
         if (!response.ok) {
           throw new Error(`EASUZ ${resourceName} returned HTTP ${response.status}`);
